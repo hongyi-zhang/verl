@@ -22,6 +22,7 @@ import os
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
 
@@ -355,10 +356,210 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _forward_micro_batch_response_logits(self, micro_batch) -> torch.Tensor:
+        """
+        Compute response token logits for a given micro-batch.
+        Returns:
+            logits_resp: (bsz, response_length, vocab_size)
+        """
+        response_length = micro_batch["responses"].size(-1)
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            from verl.utils.model import extract_multi_modal_inputs
+
+            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+            temperature = micro_batch.get("temperature", 1.0)
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                if position_ids.dim() == 3:
+                    position_ids_rmpad = (
+                        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                        .transpose(0, 1)
+                        .unsqueeze(1)
+                    )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                else:
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+
+                if "image_bound" in multi_modal_inputs:
+                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
+
+                    multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
+                        input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
+                    )
+
+                # pad and slice the inputs if sp > 1
+                if self.use_ulysses_sp:
+                    is_vlm_model = hasattr(
+                        getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
+                    )
+                    if is_vlm_model:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                    else:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                extra_args = {}
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )
+
+                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                if temperature != 1.0:
+                    logits_rmpad.div_(temperature)
+
+                if self.use_ulysses_sp:
+                    # gather and unpad for the ulysses sp
+                    logits_rmpad = gather_outputs_and_unpad(
+                        logits_rmpad,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                # pad back to (bsz, seqlen, vocab)
+                full_logits = pad_input(
+                    hidden_states=logits_rmpad,
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+                logits_resp = full_logits[:, -response_length - 1 : -1, :]
+            else:
+                extra_args = {}
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )
+                logits = output.logits
+                if temperature != 1.0:
+                    logits.div_(temperature)
+                logits_resp = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+
+            return logits_resp
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+
+        # Privileged context self-distillation path (teacher vs student distributions)
+        if "teacher_input_ids" in data.batch:
+            temperature = data.meta_info["temperature"]
+            has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+            select_keys = [
+                "responses",
+                "response_mask",
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+            ]
+            non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+            data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+            mini_batches = data.split(self.config.ppo_mini_batch_size)
+            metrics = {}
+            for _ in range(self.config.ppo_epochs):
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                for mini_batch in mini_batches:
+                    if self.config.use_dynamic_bsz:
+                        micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    else:
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        )
+                        micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                    self.actor_optimizer.zero_grad()
+
+                    for micro_batch in micro_batches:
+                        micro_batch = micro_batch.to(get_device_id())
+                        response_mask = micro_batch.batch["response_mask"]
+                        loss_agg_mode = self.config.loss_agg_mode
+
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
+                        # Construct student and teacher inputs
+                        student_inputs = {
+                            "input_ids": micro_batch.batch["input_ids"],
+                            "attention_mask": micro_batch.batch["attention_mask"],
+                            "position_ids": micro_batch.batch["position_ids"],
+                            "responses": micro_batch.batch["responses"],
+                            **micro_batch.non_tensor_batch,
+                            "temperature": temperature,
+                        }
+                        teacher_inputs = {
+                            "input_ids": micro_batch.batch["teacher_input_ids"],
+                            "attention_mask": micro_batch.batch["teacher_attention_mask"],
+                            "position_ids": micro_batch.batch["teacher_position_ids"],
+                            "responses": micro_batch.batch["responses"],
+                            **micro_batch.non_tensor_batch,
+                            "temperature": temperature,
+                        }
+
+                        # Forward passes
+                        student_logits = self._forward_micro_batch_response_logits(student_inputs)  # (B, L, V)
+                        with torch.no_grad():
+                            teacher_logits = self._forward_micro_batch_response_logits(teacher_inputs)  # (B, L, V)
+
+                        # Reverse KL: KL(student || teacher) over vocab for each response token
+                        student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+                        teacher_log_probs = F.log_softmax(teacher_logits.float(), dim=-1)
+                        student_probs = student_log_probs.exp()
+                        kl_token = torch.sum(student_probs * (student_log_probs - teacher_log_probs), dim=-1)
+                        rev_kl = agg_loss(loss_mat=kl_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        loss = rev_kl * loss_scale_factor
+                        loss.backward()
+
+                        metrics_batch = {
+                            "actor/reverse_kl": rev_kl.detach().item() * loss_scale_factor,
+                        }
+                        append_to_dict(metrics, metrics_batch)
+
+                    grad_norm = self._optimizer_step()
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+            self.actor_optimizer.zero_grad()
+            return metrics
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 

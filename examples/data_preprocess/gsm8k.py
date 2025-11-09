@@ -79,6 +79,8 @@ if __name__ == "__main__":
                     "split": split,
                     "index": idx,
                     "answer": answer_raw,
+                    # Provide privileged context for self-distillation (teacher sees ground-truth)
+                    "privileged_context": answer_raw,
                     "question": question_raw,
                 },
             }

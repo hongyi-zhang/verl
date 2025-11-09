@@ -367,9 +367,61 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
 
+            # Build teacher prompt with privileged context (LLM-only path)
+            privileged_context = (
+                row_dict.get("extra_info", {}).get("privileged_context", None)
+                if isinstance(row_dict.get("extra_info", {}), dict)
+                else None
+            )
+            # Fallback to answer if privileged_context is not explicitly provided
+            if privileged_context is None and isinstance(row_dict.get("extra_info", {}), dict):
+                privileged_context = row_dict["extra_info"].get("answer", None)
+
+            if privileged_context is not None:
+                teacher_messages = copy.deepcopy(messages)
+                if isinstance(teacher_messages, list) and len(teacher_messages) > 0:
+                    # Append privileged context to the last message content
+                    last_idx = len(teacher_messages) - 1
+                    if isinstance(teacher_messages[last_idx].get("content", ""), str):
+                        teacher_messages[last_idx]["content"] = (
+                            teacher_messages[last_idx]["content"] + "\n" + str(privileged_context)
+                        )
+                    else:
+                        # If content is non-text unexpectedly, fall back to string concat
+                        teacher_messages[last_idx]["content"] = (
+                            str(teacher_messages[last_idx]["content"]) + "\n" + str(privileged_context)
+                        )
+
+                    teacher_raw_prompt = self.tokenizer.apply_chat_template(
+                        teacher_messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                    )
+                    teacher_model_inputs = self.tokenizer(
+                        teacher_raw_prompt, return_tensors="pt", add_special_tokens=False
+                    )
+                    teacher_input_ids = teacher_model_inputs.pop("input_ids")
+                    teacher_attention_mask = teacher_model_inputs.pop("attention_mask")
+                else:
+                    # No valid messages; fall back to student prompt as teacher prompt
+                    teacher_input_ids = input_ids.clone()
+                    teacher_attention_mask = attention_mask.clone()
+            else:
+                # If no privileged context, mirror student prompt as teacher prompt
+                teacher_input_ids = input_ids.clone()
+                teacher_attention_mask = attention_mask.clone()
+
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            max_length=self.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.truncation,
+        )
+
+        # Postprocess teacher prompt tensors to the same max prompt length
+        teacher_input_ids, teacher_attention_mask = verl_F.postprocess_data(
+            input_ids=teacher_input_ids,
+            attention_mask=teacher_attention_mask,
             max_length=self.max_prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
@@ -415,6 +467,10 @@ class RLHFDataset(Dataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
+        # Teacher prompt tensors (text-only)
+        row_dict["teacher_input_ids"] = teacher_input_ids[0]
+        row_dict["teacher_attention_mask"] = teacher_attention_mask[0]
+        row_dict["teacher_position_ids"] = compute_position_id_with_mask(teacher_attention_mask)[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
