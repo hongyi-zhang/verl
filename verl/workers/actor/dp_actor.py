@@ -355,6 +355,212 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _forward_micro_batch_distributions(self, micro_batch, temperature) -> torch.Tensor:
+        """
+        Returns:
+            logits: # (bs, response_len, vocab_size) - distributions over response tokens
+        """
+        response_length = micro_batch["responses"].size(-1)
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            from verl.utils.model import extract_multi_modal_inputs
+
+            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+
+            # We only support the non-rmpad case for now
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **multi_modal_inputs,
+                use_cache=False,
+            )  # prevent model thinks we are generating
+
+            logits = output.logits
+            logits.div_(temperature)
+            logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+
+            return logits
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_distributions(self, data: DataProto) -> torch.Tensor:
+        """Compute the distributions (logits) of the responses given input_ids, attention_mask and position_ids
+        
+        This is used for privileged context self-distillation where we need the full distributions,
+        not just the log probabilities of the generated tokens.
+
+        Args:
+            data (DataProto): a DataProto containing keys
+
+                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
+                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
+
+                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
+
+        Returns:
+            torch.Tensor: the logits tensor of shape [batch_size, response_length, vocab_size]
+        """
+        # set to eval
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        logits_lst = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                logits = self._forward_micro_batch_distributions(model_inputs, temperature=temperature)
+            logits_lst.append(logits)
+
+        logits = torch.concat(logits_lst, dim=0)
+
+        if use_dynamic_bsz:
+            logits = restore_dynamic_batch(logits, batch_idx_list)
+
+        return logits
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_with_distillation(self, data: DataProto):
+        """Update policy using reverse KL distillation loss between teacher and student distributions.
+        
+        The teacher uses privileged context (e.g., ground truth answers) while the student does not.
+        This method implements on-policy privileged context self-distillation.
+        
+        Args:
+            data (DataProto): a DataProto containing keys for both teacher and student forward passes
+        
+        Returns:
+            dict: metrics including loss and gradients
+        """
+        # make sure we are in training mode
+        self.actor_module.train()
+
+        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",  # student input
+            "attention_mask",  # student attention
+            "position_ids",  # student position
+            "teacher_input_ids",
+            "teacher_attention_mask",
+            "teacher_position_ids",
+        ]
+
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # Split to make minibatch iterator for updating the actor
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+        metrics = {}
+        for _ in range(self.config.ppo_epochs):
+            for mini_batch in mini_batches:
+                mini_batch = mini_batch.to(get_device_id())
+                
+                # Forward pass with teacher inputs (with privileged context) - no gradient
+                teacher_data = DataProto(
+                    batch={
+                        "input_ids": mini_batch.batch["teacher_input_ids"],
+                        "attention_mask": mini_batch.batch["teacher_attention_mask"],
+                        "position_ids": mini_batch.batch["teacher_position_ids"],
+                        "responses": mini_batch.batch["responses"],
+                    },
+                    non_tensor_batch=mini_batch.non_tensor_batch,
+                    meta_info={
+                        "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
+                        "temperature": temperature,
+                        "use_dynamic_bsz": False,
+                    }
+                )
+                with torch.no_grad():
+                    teacher_logits = self.compute_distributions(teacher_data)  # (bsz, response_len, vocab_size)
+                    teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim=-1)  # detached
+                
+                # Forward pass with student inputs (without privileged context) - with gradient
+                student_data = DataProto(
+                    batch={
+                        "input_ids": mini_batch.batch["input_ids"],
+                        "attention_mask": mini_batch.batch["attention_mask"],
+                        "position_ids": mini_batch.batch["position_ids"],
+                        "responses": mini_batch.batch["responses"],
+                    },
+                    non_tensor_batch=mini_batch.non_tensor_batch,
+                    meta_info={
+                        "micro_batch_size": self.config.ppo_micro_batch_size_per_gpu,
+                        "temperature": temperature,
+                        "use_dynamic_bsz": False,
+                    }
+                )
+                
+                # Compute student logits with gradient
+                student_logits = []
+                micro_batches_student = student_data.split(self.config.ppo_micro_batch_size_per_gpu)
+                for micro_batch_student in micro_batches_student:
+                    micro_batch_student = micro_batch_student.to(get_device_id())
+                    model_inputs = {**micro_batch_student.batch, **micro_batch_student.non_tensor_batch}
+                    logits = self._forward_micro_batch_distributions(model_inputs, temperature=temperature)
+                    student_logits.append(logits)
+                student_logits = torch.concat(student_logits, dim=0)
+                student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
+                
+                # Compute reverse KL divergence: KL(teacher || student) = sum_x teacher(x) * (log teacher(x) - log student(x))
+                # This encourages student to cover all modes of teacher distribution
+                response_mask = mini_batch.batch["response_mask"]  # (bsz, response_len)
+                
+                # Expand mask to match logits shape
+                response_mask_expanded = response_mask.unsqueeze(-1)  # (bsz, response_len, 1)
+                
+                # Compute per-token reverse KL
+                per_token_kl = torch.sum(
+                    torch.exp(teacher_log_probs) * (teacher_log_probs - student_log_probs),
+                    dim=-1
+                )  # (bsz, response_len)
+                
+                # Mask and average
+                masked_kl = per_token_kl * response_mask
+                loss = masked_kl.sum() / response_mask.sum()
+                
+                # Backward and optimize
+                self.actor_optimizer.zero_grad()
+                loss.backward()
+                self._optimizer_step()
+                
+                # Collect metrics
+                metrics["distillation/loss"] = loss.detach().item()
+                metrics["distillation/kl_div"] = masked_kl.sum().detach().item() / response_mask.sum().item()
+                
+        return metrics
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode

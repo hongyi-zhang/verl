@@ -80,6 +80,7 @@ if __name__ == "__main__":
                     "index": idx,
                     "answer": answer_raw,
                     "question": question_raw,
+                    "privileged_context": answer_raw,  # For privileged context self-distillation
                 },
             }
             return data

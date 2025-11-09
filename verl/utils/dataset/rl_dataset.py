@@ -294,6 +294,20 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
+        
+        # For privileged context self-distillation: create teacher messages with privileged context
+        teacher_messages = None
+        privileged_context = row_dict.get("extra_info", {}).get("privileged_context", None)
+        if privileged_context is not None:
+            teacher_messages = copy.deepcopy(messages)
+            # Append privileged context to the last message's content
+            if teacher_messages and len(teacher_messages) > 0:
+                last_message = teacher_messages[-1]
+                if isinstance(last_message["content"], str):
+                    last_message["content"] = last_message["content"] + "\n" + privileged_context
+                elif isinstance(last_message["content"], list):
+                    # For multimodal content
+                    last_message["content"].append({"type": "text", "text": "\n" + privileged_context})
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -415,6 +429,74 @@ class RLHFDataset(Dataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
+        
+        # Process teacher inputs if privileged context is present
+        if teacher_messages is not None:
+            if self.processor is not None:
+                teacher_raw_prompt = self.processor.apply_chat_template(
+                    teacher_messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                )
+                teacher_model_inputs = self.processor(
+                    text=[teacher_raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs, return_tensors="pt"
+                )
+                teacher_input_ids = teacher_model_inputs.pop("input_ids")
+                teacher_attention_mask = teacher_model_inputs.pop("attention_mask")
+            else:
+                teacher_raw_prompt = self.tokenizer.apply_chat_template(
+                    teacher_messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                )
+                teacher_model_inputs = self.tokenizer(teacher_raw_prompt, return_tensors="pt", add_special_tokens=False)
+                teacher_input_ids = teacher_model_inputs.pop("input_ids")
+                teacher_attention_mask = teacher_model_inputs.pop("attention_mask")
+            
+            teacher_input_ids, teacher_attention_mask = verl_F.postprocess_data(
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                max_length=self.max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.truncation,
+            )
+            
+            # Handle position_ids for teacher (similar to student)
+            if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                    from verl.models.transformers.qwen3_vl import get_rope_index
+                else:
+                    from verl.models.transformers.qwen2_vl import get_rope_index
+                
+                teacher_vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=teacher_input_ids[0],
+                    image_grid_thw=model_inputs.get("image_grid_thw") if self.processor is not None else None,
+                    video_grid_thw=model_inputs.get("video_grid_thw") if self.processor is not None else None,
+                    second_per_grid_ts=model_inputs.get("second_per_grid_ts") if self.processor is not None else None,
+                    attention_mask=teacher_attention_mask[0],
+                )
+                valid_mask = teacher_attention_mask[0].bool()
+                teacher_text_position_ids = torch.ones((1, len(teacher_input_ids[0])), dtype=torch.long)
+                teacher_text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                teacher_position_ids = [torch.cat((teacher_text_position_ids, teacher_vision_position_ids), dim=0)]
+            elif self.processor is not None and "Glm4vImageProcessor" in self.processor.image_processor.__class__.__name__:
+                from verl.models.transformers.glm4v import get_rope_index
+                
+                teacher_vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=teacher_input_ids[0],
+                    image_grid_thw=model_inputs.get("image_grid_thw") if self.processor is not None else None,
+                    video_grid_thw=model_inputs.get("video_grid_thw") if self.processor is not None else None,
+                    attention_mask=teacher_attention_mask[0],
+                )
+                valid_mask = teacher_attention_mask[0].bool()
+                teacher_text_position_ids = torch.ones((1, len(teacher_input_ids[0])), dtype=torch.long)
+                teacher_text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                teacher_position_ids = [torch.cat((teacher_text_position_ids, teacher_vision_position_ids), dim=0)]
+            else:
+                teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+            
+            row_dict["teacher_input_ids"] = teacher_input_ids[0]
+            row_dict["teacher_attention_mask"] = teacher_attention_mask[0]
+            row_dict["teacher_position_ids"] = teacher_position_ids[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
