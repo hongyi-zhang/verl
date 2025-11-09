@@ -361,7 +361,109 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
+        # Privileged Context Self-Distillation (reverse KL) path
+        if loss_mode == "pcsd_rev_kl":
+            # Expect teacher/student inputs prepared by worker
+            select_keys = [
+                "responses",
+                "response_mask",
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+                "student_input_ids",
+                "student_attention_mask",
+                "student_position_ids",
+            ]
+            has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+            non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+            data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+            # Split to make minibatch iterator
+            if self.config.use_dynamic_bsz:
+                max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                mini_batches, _ = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            else:
+                mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+            metrics = {}
+            kl_coef = self.config.policy_loss.get("pcsd_kl_coef", 1.0)
+            teacher_temperature = self.config.policy_loss.get("pcsd_teacher_temperature", temperature)
+            self.actor_optimizer.zero_grad()
+
+            for mini_batch in mini_batches:
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                else:
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    response_mask = model_inputs["response_mask"].to(bool)
+                    responses = model_inputs["responses"]
+                    response_length = responses.size(1)
+                    loss_agg_mode = self.config.loss_agg_mode
+
+                    # scale for dyn bsz vs accum
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / self.gradient_accumulation
+
+                    # Forward student (with gradients)
+                    with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                        stu_out = self.actor_module(
+                            input_ids=model_inputs["student_input_ids"],
+                            attention_mask=model_inputs["student_attention_mask"],
+                            position_ids=model_inputs["student_position_ids"],
+                            **model_inputs.get("multi_modal_inputs", {}),
+                            use_cache=False,
+                        )
+                        stu_logits = stu_out.logits
+                        stu_logits = stu_logits[:, -response_length - 1 : -1, :]  # next-token logits on response
+                        stu_logits = stu_logits.div(temperature)
+                        stu_logps = torch.log_softmax(stu_logits.float(), dim=-1)
+
+                    # Forward teacher (no gradients)
+                    with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                        tea_out = self.actor_module(
+                            input_ids=model_inputs["teacher_input_ids"],
+                            attention_mask=model_inputs["teacher_attention_mask"],
+                            position_ids=model_inputs["teacher_position_ids"],
+                            **model_inputs.get("multi_modal_inputs", {}),
+                            use_cache=False,
+                        )
+                        tea_logits = tea_out.logits
+                        tea_logits = tea_logits[:, -response_length - 1 : -1, :]
+                        tea_logits = tea_logits.div(teacher_temperature)
+                        tea_logps = torch.log_softmax(tea_logits.float(), dim=-1)
+
+                    # Reverse KL per token: KL(student || teacher)
+                    stu_ps = torch.exp(stu_logps)
+                    token_kl = torch.sum(stu_ps * (stu_logps - tea_logps), dim=-1)  # [bs, resp_len]
+
+                    kl_loss = agg_loss(loss_mat=token_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    loss = kl_coef * kl_loss * loss_scale_factor
+                    loss.backward()
+
+                    metrics.setdefault("actor/pcsd_reverse_kl", 0.0)
+                    metrics["actor/pcsd_reverse_kl"] += (kl_loss.detach().item() * loss_scale_factor)
+                    metrics["actor/pcsd_kl_coef"] = kl_coef
+
+            grad_norm = self._optimizer_step()
+            metrics["actor/grad_norm"] = grad_norm.detach().item()
+            self.actor_optimizer.zero_grad()
+            return metrics
+
+        # ===== Standard PPO / GRPO path =====
         select_keys = [
             "responses",
             "response_mask",

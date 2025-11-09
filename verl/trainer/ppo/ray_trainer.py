@@ -514,7 +514,9 @@ class RayPPOTrainer:
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        # Keep privileged_context on driver for post-rollout training (e.g., PCSD)
+        keep_keys = {"privileged_context"}
+        non_tensor_batch_keys_to_pop = (set(batch.non_tensor_batch.keys()) - reward_model_keys) - keep_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
@@ -1079,6 +1081,109 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
+                # PCSD path doesn't require reward/advantage; handle early
+                pcsd_mode = (
+                    hasattr(self.config.actor_rollout_ref.actor, "policy_loss")
+                    and self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "") == "pcsd_rev_kl"
+                )
+                if pcsd_mode:
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # ensure temperature is available on worker side
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                    # Update actor with reverse KL distillation loss; worker will build teacher/student inputs
+                    with marked_timer("update_actor", timing_raw, color="red"):
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_output_metrics)
+                    # optional: checkpointing/testing follow the same cadence below
+                    # Log rollout generations if enabled (keep for debugging)
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        # reward_extra_infos_dict is undefined in this path; pass empty
+                        self._log_rollout_data(batch, {}, timing_raw, rollout_data_dir)
+                    # Skip the rest of PPO/critic steps
+                    # validate
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+                    # ESI checkpointing logic
+                    esi_close_to_expiration = should_save_ckpt_esi(
+                        max_steps_duration=self.max_steps_duration,
+                        redundant_time=self.config.trainer.esi_redundant_time,
+                    )
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                    ):
+                        if esi_close_to_expiration:
+                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint()
+                    with marked_timer("stop_profile", timing_raw):
+                        next_step_profile = (
+                            self.global_steps + 1 in self.config.global_profiler.steps
+                            if self.config.global_profiler.steps is not None
+                            else False
+                        )
+                        self._stop_profiling(
+                            curr_step_profile and not next_step_profile
+                            if self.config.global_profiler.profile_continuous_steps
+                            else curr_step_profile
+                        )
+                        prev_step_profile = curr_step_profile
+                        curr_step_profile = next_step_profile
+
+                    steps_duration = timing_raw["step"]
+                    self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                    # training metrics
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    # collect metrics
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=False))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                    # curriculum sampler update if present
+                    if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                        self.train_dataloader.sampler.update(batch=batch)
+
+                    # TODO: make a canonical logger that supports various backend
+                    logger.log(data=metrics, step=self.global_steps)
+
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if (
+                        hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                        and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    ):
+                        self.actor_rollout_wg.dump_memory_snapshot(
+                            tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                        )
+
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+
+                    if hasattr(self.train_dataset, "on_batch_end"):
+                        self.train_dataset.on_batch_end(batch=batch)
+                    # proceed to next batch
+                    continue
+
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).

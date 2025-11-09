@@ -872,6 +872,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
+            # Prepare inputs for Privileged Context Self-Distillation if enabled
+            try:
+                loss_mode = self.config.actor.policy_loss.get("loss_mode", "")
+            except Exception:
+                loss_mode = ""
+            if loss_mode == "pcsd_rev_kl" and "privileged_context" in data.non_tensor_batch:
+                data = self._prepare_pcsd_inputs(data)
+
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -1029,6 +1037,91 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    def _prepare_pcsd_inputs(self, data: DataProto) -> DataProto:
+        """
+        Build teacher/student inputs for Privileged Context Self-Distillation on worker (uses local tokenizer).
+        - Student inputs reuse existing input_ids/attention_mask/position_ids.
+        - Teacher inputs insert privileged_context tokens between prompt and response.
+        """
+        import torch.nn.functional as F
+
+        batch = data.batch
+        tokenizer = getattr(self, "tokenizer", None)
+        assert tokenizer is not None, "Tokenizer is required to build privileged context inputs"
+
+        input_ids = batch["input_ids"]               # [B, prompt_len + resp_len]
+        attention_mask = batch["attention_mask"]     # [B, prompt_len + resp_len]
+        position_ids = batch["position_ids"]         # [B, ... , seq_len]
+        prompts = batch["prompts"]                   # [B, prompt_len]
+        responses = batch["responses"]               # [B, resp_len]
+        response_len = responses.shape[1]
+
+        # Compute valid lengths
+        prompt_mask = attention_mask[:, :-response_len]
+        resp_mask = attention_mask[:, -response_len:]
+        prompt_valid_lens = prompt_mask.sum(dim=1).tolist()
+        resp_valid_lens = resp_mask.sum(dim=1).tolist()
+
+        teacher_ids_list = []
+        teacher_attn_list = []
+
+        priv_ctx_list = data.non_tensor_batch["privileged_context"]
+        pad_id = tokenizer.pad_token_id
+
+        B = input_ids.shape[0]
+        for i in range(B):
+            # Extract valid prompt tokens (strip left padding)
+            prompt_full = input_ids[i, :-response_len]
+            pv = int(prompt_valid_lens[i])
+            prompt_valid = prompt_full[-pv:] if pv > 0 else prompt_full[:0]
+            # Extract valid response tokens
+            rv = int(resp_valid_lens[i])
+            resp_valid = responses[i, :rv]
+            # Tokenize privileged context
+            ctx = priv_ctx_list[i]
+            if isinstance(ctx, (list, tuple)):
+                ctx = " ".join([str(x) for x in ctx])
+            ctx_enc = tokenizer(ctx, return_tensors="pt", add_special_tokens=False)
+            ctx_ids = ctx_enc["input_ids"][0].to(prompt_valid.device)
+
+            seq_ids = torch.cat([prompt_valid, ctx_ids, resp_valid], dim=0)
+            seq_attn = torch.ones_like(seq_ids, dtype=attention_mask.dtype)
+
+            teacher_ids_list.append(seq_ids)
+            teacher_attn_list.append(seq_attn)
+
+        # Pad to max length in batch (left-pad)
+        max_len = max([t.size(0) for t in teacher_ids_list]) if teacher_ids_list else 0
+        if max_len == 0:
+            # Fallback to student as teacher if empty (shouldn't happen)
+            max_len = input_ids.shape[1]
+        teacher_input_ids = []
+        teacher_attention_mask = []
+        for ids_i, attn_i in zip(teacher_ids_list, teacher_attn_list, strict=True):
+            pad_left = max_len - ids_i.size(0)
+            teacher_input_ids.append(F.pad(ids_i, (pad_left, 0), value=pad_id))
+            teacher_attention_mask.append(F.pad(attn_i, (pad_left, 0), value=0))
+        teacher_input_ids = torch.stack(teacher_input_ids, dim=0)
+        teacher_attention_mask = torch.stack(teacher_attention_mask, dim=0)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        # Student inputs reuse original inputs
+        student_input_ids = input_ids
+        student_attention_mask = attention_mask
+        student_position_ids = position_ids
+
+        add_dp = DataProto.from_dict(
+            tensors={
+                "teacher_input_ids": teacher_input_ids,
+                "teacher_attention_mask": teacher_attention_mask,
+                "teacher_position_ids": teacher_position_ids,
+                "student_input_ids": student_input_ids,
+                "student_attention_mask": student_attention_mask,
+                "student_position_ids": student_position_ids,
+            }
+        )
+        return data.union(add_dp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
