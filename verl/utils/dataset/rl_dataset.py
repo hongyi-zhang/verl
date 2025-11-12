@@ -21,6 +21,7 @@ import re
 import traceback
 from collections import defaultdict
 from typing import Optional
+import json
 
 import datasets
 import numpy as np
@@ -291,7 +292,45 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
-        row_dict: dict = self.dataframe[item]
+        row_dict = self.dataframe[item]
+        # Normalize row into expected dict schema with self.prompt_key and extra_info
+        if isinstance(row_dict, str):
+            try:
+                parsed = json.loads(row_dict)
+                row_dict = parsed if isinstance(parsed, dict) else {
+                    self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                    "extra_info": {},
+                }
+            except Exception:
+                row_dict = {
+                    self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                    "extra_info": {},
+                }
+        elif not isinstance(row_dict, dict):
+            row_dict = {
+                self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                "extra_info": {},
+            }
+        # If the prompt key is missing, try common alternatives
+        if self.prompt_key not in row_dict:
+            if "messages" in row_dict and isinstance(row_dict["messages"], list):
+                row_dict[self.prompt_key] = row_dict.pop("messages")
+            elif "text" in row_dict:
+                row_dict[self.prompt_key] = [{"role": "user", "content": str(row_dict.pop("text"))}]
+            else:
+                # Fallback: use the first string-like value
+                fallback_text = None
+                for v in row_dict.values():
+                    if isinstance(v, str):
+                        fallback_text = v
+                        break
+                if fallback_text is None:
+                    fallback_text = ""
+                row_dict[self.prompt_key] = [{"role": "user", "content": str(fallback_text)}]
+        # Ensure extra_info is a dict and provide defaults
+        if not isinstance(row_dict.get("extra_info", {}), dict):
+            row_dict["extra_info"] = {}
+        row_dict.setdefault("data_source", "unknown")
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
