@@ -107,9 +107,13 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get("image_patch_size", 14)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        # Teacher prompt can be longer than student prompt; allow separate cap and truncation policy
+        self.max_teacher_prompt_length = config.get("max_teacher_prompt_length", self.max_prompt_length)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
+        # Avoid raising when teacher prompt exceeds student cap
+        self.teacher_truncation = config.get("teacher_truncation", "left")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
@@ -418,14 +422,14 @@ class RLHFDataset(Dataset):
             truncation=self.truncation,
         )
 
-        # Postprocess teacher prompt tensors to the same max prompt length
+        # Postprocess teacher prompt tensors with an independent cap
         teacher_input_ids, teacher_attention_mask = verl_F.postprocess_data(
             input_ids=teacher_input_ids,
             attention_mask=teacher_attention_mask,
-            max_length=self.max_prompt_length,
+            max_length=self.max_teacher_prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
-            truncation=self.truncation,
+            truncation=self.teacher_truncation,
         )
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
