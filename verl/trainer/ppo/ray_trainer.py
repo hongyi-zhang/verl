@@ -1059,13 +1059,23 @@ class RayPPOTrainer:
                                 # Decode first sample prompt (question) and rollout answer
                                 prompt_ids_0 = gen_batch_output.batch["prompts"][0] if "prompts" in gen_batch_output.batch.keys() else gen_batch.batch["input_ids"][0]
                                 resp_ids_0 = gen_batch_output.batch["responses"][0]
-                                q_text = self.tokenizer.decode(prompt_ids_0, skip_special_tokens=True)
+                                q_text_full = self.tokenizer.decode(prompt_ids_0, skip_special_tokens=True)
+                                # Try to extract the actual question after 'Question:' to avoid chat-template system text
+                                q_text = q_text_full
+                                try:
+                                    import re as _re
+                                    m = _re.search(r"Question:\\s*(.*)", q_text_full, flags=_re.IGNORECASE | _re.DOTALL)
+                                    if m:
+                                        q_text = m.group(1).split("\\n")[0]
+                                except Exception:
+                                    pass
                                 a_text = self.tokenizer.decode(resp_ids_0, skip_special_tokens=True)
                                 # Privileged context preview from original gen batch extra_info
                                 pc_preview = ""
-                                if "extra_info" in gen_batch.non_tensor_batch:
+                                # Note: extra_info is retained on the original 'batch' (not in gen_batch)
+                                if "extra_info" in batch.non_tensor_batch:
                                     try:
-                                        ei0 = gen_batch.non_tensor_batch["extra_info"][0]
+                                        ei0 = batch.non_tensor_batch["extra_info"][0]
                                         if isinstance(ei0, dict):
                                             pc = ei0.get("privileged_context", "")
                                             if isinstance(pc, str):
