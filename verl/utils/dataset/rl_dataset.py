@@ -409,6 +409,8 @@ class RLHFDataset(Dataset):
 
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
+            # preserve unpadded prompt ids for vLLM raw_prompt_ids
+            raw_input_ids = input_ids.clone()
 
             if "second_per_grid_ts" in model_inputs:
                 model_inputs.pop("second_per_grid_ts")
@@ -436,6 +438,8 @@ class RLHFDataset(Dataset):
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
+            # preserve unpadded prompt ids for vLLM raw_prompt_ids
+            raw_input_ids = input_ids.clone()
 
             # Build teacher prompt with privileged context (LLM-only path)
             privileged_context = (
@@ -542,7 +546,8 @@ class RLHFDataset(Dataset):
         row_dict["teacher_attention_mask"] = teacher_attention_mask[0]
         row_dict["teacher_position_ids"] = compute_position_id_with_mask(teacher_attention_mask)[0]
 
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        # Use the same unpadded prompt token ids we fed into the actor to keep vLLM prompt_token_ids aligned
+        raw_prompt_ids = raw_input_ids[0].tolist()
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
