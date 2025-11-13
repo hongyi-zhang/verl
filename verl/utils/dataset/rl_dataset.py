@@ -152,11 +152,39 @@ class RLHFDataset(Dataset):
 
     def _read_files_and_tokenize(self):
         dataframes = []
-        for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+        for data_file in self.data_files:
+            # Support parquet (default) and csv sources
+            if isinstance(data_file, str) and data_file.lower().endswith(".csv"):
+                dataframe = datasets.load_dataset("csv", data_files=data_file)["train"]
+
+                def _csv_to_rl(row):
+                    # Build prompt from CSV question
+                    question = row.get("question", "")
+                    if not isinstance(question, str):
+                        question = str(question) if question is not None else ""
+                    prompt = "Answer the question. Output final answer after '####'.\nQuestion: " + question.strip()
+                    # Map privileged context and answer
+                    privileged_context = row.get("original_news", "")
+                    if not isinstance(privileged_context, str):
+                        privileged_context = str(privileged_context) if privileged_context is not None else ""
+                    ans = row.get("answer", "")
+                    if not isinstance(ans, str):
+                        ans = str(ans) if ans is not None else ""
+                    data_source = row.get("source", "news")
+                    if not isinstance(data_source, str):
+                        data_source = str(data_source) if data_source is not None else "news"
+                    return {
+                        "data_source": data_source,
+                        "prompt": prompt,
+                        "extra_info": {"privileged_context": privileged_context, "answer": ans},
+                    }
+
+                dataframe = dataframe.map(_csv_to_rl, remove_columns=[c for c in dataframe.column_names if c not in ("data_source", "prompt", "extra_info")])
+            else:
+                # read parquet files and cache
+                dataframe = datasets.load_dataset("parquet", data_files=data_file)["train"]
             dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes) if len(dataframes) > 1 else dataframes[0]
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")

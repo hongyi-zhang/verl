@@ -1048,6 +1048,37 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                        # Optional debug print of question/answer/privileged_context
+                        try:
+                            debug_print = bool(self.config.trainer.get("debug_print_samples", False))
+                            debug_every = int(self.config.trainer.get("debug_print_every", 50))
+                        except Exception:
+                            debug_print, debug_every = False, 50
+                        if debug_print and (self.global_steps % max(1, debug_every) == 0):
+                            try:
+                                # Decode first sample prompt (question) and rollout answer
+                                prompt_ids_0 = gen_batch_output.batch["prompts"][0] if "prompts" in gen_batch_output.batch.keys() else gen_batch.batch["input_ids"][0]
+                                resp_ids_0 = gen_batch_output.batch["responses"][0]
+                                q_text = self.tokenizer.decode(prompt_ids_0, skip_special_tokens=True)
+                                a_text = self.tokenizer.decode(resp_ids_0, skip_special_tokens=True)
+                                # Privileged context preview from original gen batch extra_info
+                                pc_preview = ""
+                                if "extra_info" in gen_batch.non_tensor_batch:
+                                    try:
+                                        ei0 = gen_batch.non_tensor_batch["extra_info"][0]
+                                        if isinstance(ei0, dict):
+                                            pc = ei0.get("privileged_context", "")
+                                            if isinstance(pc, str):
+                                                pc_preview = pc[:200]
+                                    except Exception:
+                                        pc_preview = ""
+                                print("[DEBUG SAMPLE]")
+                                print("  Question:", q_text[:200])
+                                print("  Rollout Answer:", a_text[:200])
+                                print("  Privileged Preview:", pc_preview)
+                            except Exception as _:
+                                pass
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
