@@ -355,6 +355,9 @@ class RLHFDataset(Dataset):
                 if fallback_text is None:
                     fallback_text = ""
                 row_dict[self.prompt_key] = [{"role": "user", "content": str(fallback_text)}]
+        # Ensure prompt is in messages(list-of-dicts) form, not plain string
+        if isinstance(row_dict.get(self.prompt_key), str):
+            row_dict[self.prompt_key] = [{"role": "user", "content": row_dict[self.prompt_key]}]
         # Ensure extra_info is a dict and provide defaults
         if not isinstance(row_dict.get("extra_info", {}), dict):
             row_dict["extra_info"] = {}
