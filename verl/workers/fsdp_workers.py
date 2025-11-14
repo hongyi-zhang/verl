@@ -871,6 +871,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            # Ensure required meta_info defaults are present
+            if "temperature" not in data.meta_info:
+                data.meta_info["temperature"] = self.config.rollout.temperature
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:

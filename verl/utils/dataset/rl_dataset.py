@@ -21,6 +21,7 @@ import re
 import traceback
 from collections import defaultdict
 from typing import Optional
+import json
 
 import datasets
 import numpy as np
@@ -155,11 +156,39 @@ class RLHFDataset(Dataset):
 
     def _read_files_and_tokenize(self):
         dataframes = []
-        for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+        for data_file in self.data_files:
+            # Support parquet (default) and csv sources
+            if isinstance(data_file, str) and data_file.lower().endswith(".csv"):
+                dataframe = datasets.load_dataset("csv", data_files=data_file)["train"]
+
+                def _csv_to_rl(row):
+                    # Build prompt from CSV question
+                    question = row.get("question", "")
+                    if not isinstance(question, str):
+                        question = str(question) if question is not None else ""
+                    prompt = "Answer the question. Output final answer after '####'.\nQuestion: " + question.strip()
+                    # Map privileged context and answer
+                    privileged_context = row.get("original_news", "")
+                    if not isinstance(privileged_context, str):
+                        privileged_context = str(privileged_context) if privileged_context is not None else ""
+                    ans = row.get("answer", "")
+                    if not isinstance(ans, str):
+                        ans = str(ans) if ans is not None else ""
+                    data_source = row.get("source", "news")
+                    if not isinstance(data_source, str):
+                        data_source = str(data_source) if data_source is not None else "news"
+                    return {
+                        "data_source": data_source,
+                        "prompt": prompt,
+                        "extra_info": {"privileged_context": privileged_context, "answer": ans},
+                    }
+
+                dataframe = dataframe.map(_csv_to_rl, remove_columns=[c for c in dataframe.column_names if c not in ("data_source", "prompt", "extra_info")])
+            else:
+                # read parquet files and cache
+                dataframe = datasets.load_dataset("parquet", data_files=data_file)["train"]
             dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes) if len(dataframes) > 1 else dataframes[0]
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
@@ -295,7 +324,48 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
-        row_dict: dict = self.dataframe[item]
+        row_dict = self.dataframe[item]
+        # Normalize row into expected dict schema with self.prompt_key and extra_info
+        if isinstance(row_dict, str):
+            try:
+                parsed = json.loads(row_dict)
+                row_dict = parsed if isinstance(parsed, dict) else {
+                    self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                    "extra_info": {},
+                }
+            except Exception:
+                row_dict = {
+                    self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                    "extra_info": {},
+                }
+        elif not isinstance(row_dict, dict):
+            row_dict = {
+                self.prompt_key: [{"role": "user", "content": str(row_dict)}],
+                "extra_info": {},
+            }
+        # If the prompt key is missing, try common alternatives
+        if self.prompt_key not in row_dict:
+            if "messages" in row_dict and isinstance(row_dict["messages"], list):
+                row_dict[self.prompt_key] = row_dict.pop("messages")
+            elif "text" in row_dict:
+                row_dict[self.prompt_key] = [{"role": "user", "content": str(row_dict.pop("text"))}]
+            else:
+                # Fallback: use the first string-like value
+                fallback_text = None
+                for v in row_dict.values():
+                    if isinstance(v, str):
+                        fallback_text = v
+                        break
+                if fallback_text is None:
+                    fallback_text = ""
+                row_dict[self.prompt_key] = [{"role": "user", "content": str(fallback_text)}]
+        # Ensure prompt is in messages(list-of-dicts) form, not plain string
+        if isinstance(row_dict.get(self.prompt_key), str):
+            row_dict[self.prompt_key] = [{"role": "user", "content": row_dict[self.prompt_key]}]
+        # Ensure extra_info is a dict and provide defaults
+        if not isinstance(row_dict.get("extra_info", {}), dict):
+            row_dict["extra_info"] = {}
+        row_dict.setdefault("data_source", "unknown")
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
@@ -343,6 +413,8 @@ class RLHFDataset(Dataset):
 
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
+            # preserve unpadded prompt ids for vLLM raw_prompt_ids
+            raw_input_ids = input_ids.clone()
 
             if "second_per_grid_ts" in model_inputs:
                 model_inputs.pop("second_per_grid_ts")
@@ -370,6 +442,8 @@ class RLHFDataset(Dataset):
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
+            # preserve unpadded prompt ids for vLLM raw_prompt_ids
+            raw_input_ids = input_ids.clone()
 
             # Build teacher prompt with privileged context (LLM-only path)
             privileged_context = (
@@ -476,7 +550,8 @@ class RLHFDataset(Dataset):
         row_dict["teacher_attention_mask"] = teacher_attention_mask[0]
         row_dict["teacher_position_ids"] = compute_position_id_with_mask(teacher_attention_mask)[0]
 
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        # Use the same unpadded prompt token ids we fed into the actor to keep vLLM prompt_token_ids aligned
+        raw_prompt_ids = raw_input_ids[0].tolist()
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
