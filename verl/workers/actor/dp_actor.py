@@ -547,6 +547,25 @@ class DataParallelPPOActor(BasePPOActor):
                         kl_token = torch.sum(student_probs * (student_log_probs - teacher_log_probs), dim=-1)
                         rev_kl = agg_loss(loss_mat=kl_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
+                        # Debug C: inspect distributions/targets on the chosen global step
+                        try:
+                            _dbg_env = int(os.getenv("PCSD_DEBUG_STEP", "-1"))
+                            _cur_step = int(data.meta_info.get("global_steps", -999999))
+                            if _dbg_env == _cur_step:
+                                _resp0 = micro_batch.batch["responses"][0]
+                                _vlen = int(response_mask[0].sum().item())
+                                _eos_id = getattr(getattr(self.actor_module, "module", self.actor_module).config, "eos_token_id", None)
+                                _s0 = student_log_probs[0, 0]
+                                _t0 = teacher_log_probs[0, 0]
+                                _sv, _si = torch.topk(_s0, k=min(5, _s0.numel()))
+                                _tv, _ti = torch.topk(_t0, k=min(5, _t0.numel()))
+                                print("==== PCSD DEBUG (C) first-token dist ===")
+                                print("step:", _cur_step, "eos_id:", _eos_id, "first_resp_id:", int(_resp0[0].item()) if _vlen > 0 else None)
+                                print("student top5 ids:", _si.tolist(), "probs:", torch.exp(_sv).tolist())
+                                print("teacher top5 ids:", _ti.tolist(), "probs:", torch.exp(_tv).tolist())
+                        except Exception:
+                            pass
+
                         loss = rev_kl * loss_scale_factor
                         loss.backward()
 

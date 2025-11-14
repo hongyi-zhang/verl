@@ -1129,16 +1129,32 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Debug A: print one batch's KL/response mask + full decoded text at a chosen step
+                    # Debug A: print one batch's masks + texts + sampling params when debug_step matches
                     if self.global_steps == debug_step:
                         try:
                             ids0 = batch.batch["input_ids"][0]
                             mask0 = batch.batch["response_mask"][0]
-                            text0 = self.tokenizer.decode(ids0, skip_special_tokens=False)
+                            resp_ids0 = batch.batch["responses"][0]
+                            resp_len0 = int(mask0.sum().item()) if mask0 is not None else int(resp_ids0.shape[-1])
+                            text0 = self.kTokenizer.decode(ids0, skip_special_tokens=False) if hasattr(self, "kTokenizer") else self.tokenizer.decode(ids0, skip_special_tokens=False)
+                            first_resp_id = int(resp_ids0[0].item()) if resp_len0 > 0 else None
+                            eos_id_dbg = getattr(self.tokenizer, "eos_token_id", None)
+                            cfg = self.config.actor_rollout_ref.rollout
                             print("==== PCSD DEBUG (A) input_ids[0] decoded ====")
                             print(text0)
                             print("==== PCSD DEBUG (A) response_mask[0] ====")
                             print(mask0.tolist())
+                            print(
+                                f"==== PCSD DEBUG (A) sampling: temp={getattr(cfg,'temperature',None)} "
+                                f"top_p={getattr(cfg,'top_p',None)} top_k={getattr(cfg,'top_k',None)} "
+                                f"ignore_eos={getattr(cfg,'ignore_eos', None)} resp_len={resp_len0} eos_id={eos_id_dbg} "
+                                f"first_resp_id={first_resp_id}"
+                            )
+                            if resp_len0 and resp_ids0.numel() > 0:
+                                print("==== PCSD DEBUG (A) response_ids[0:10] ====",
+                                      resp_ids0[: min(10, resp_len0)].tolist())
+                                print("==== PCSD DEBUG (A) response_text[0:120] ====",
+                                      self.tokenizer.decode(resp_ids0[: min(30, resp_len0)], skip_special_tokens=False))
                         except Exception as e:
                             print(f"PCSD DEBUG (A) failed: {e}")
                     # Balance the number of valid tokens across DP ranks.
