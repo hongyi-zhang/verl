@@ -962,6 +962,7 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         from omegaconf import OmegaConf
+        import os
 
         from verl.utils.tracking import Tracking
 
@@ -974,6 +975,11 @@ class RayPPOTrainer:
 
         # Enable privileged context self-distillation flow if configured
         use_pcsd = getattr(self.config.algorithm, "privileged_distill", False)
+        # Optional one-off debug step: set env PCSD_DEBUG_STEP=100 to trigger prints
+        try:
+            debug_step = int(os.getenv("PCSD_DEBUG_STEP", "-1"))
+        except Exception:
+            debug_step = -1
 
         self.global_steps = 0
 
@@ -1123,6 +1129,18 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    # Debug A: print one batch's KL/response mask + full decoded text at a chosen step
+                    if self.global_steps == debug_step:
+                        try:
+                            ids0 = batch.batch["input_ids"][0]
+                            mask0 = batch.batch["response_mask"][0]
+                            text0 = self.tokenizer.decode(ids0, skip_special_tokens=False)
+                            print("==== PCSD DEBUG (A) input_ids[0] decoded ====")
+                            print(text0)
+                            print("==== PCSD DEBUG (A) response_mask[0] ====")
+                            print(mask0.tolist())
+                        except Exception as e:
+                            print(f"PCSD DEBUG (A) failed: {e}")
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1149,6 +1167,28 @@ class RayPPOTrainer:
                                 )
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                                # Debug B: print reward raw texts and parsed score (first sample)
+                                if self.global_steps == debug_step:
+                                    try:
+                                        prompt_ids0 = batch.batch["prompts"][0]
+                                        resp_ids = batch.batch["responses"][0]
+                                        # estimate valid response length via response_mask if available
+                                        if "response_mask" in batch.batch:
+                                            valid_len = int(batch.batch["response_mask"][0].sum().item())
+                                        else:
+                                            valid_len = resp_ids.shape[-1]
+                                        resp_ids0 = resp_ids[:valid_len]
+                                        prompt_text = self.tokenizer.decode(prompt_ids0, skip_special_tokens=False)
+                                        response_text = self.tokenizer.decode(resp_ids0, skip_special_tokens=False)
+                                        parsed_score = (
+                                            reward_tensor[0, valid_len - 1].item() if valid_len > 0 else float("nan")
+                                        )
+                                        print("==== PCSD DEBUG (B) reward ====")
+                                        print("prompt_text:", prompt_text)
+                                        print("response_text:", response_text)
+                                        print("parsed score (last token):", parsed_score)
+                                    except Exception as e:
+                                        print(f"PCSD DEBUG (B) failed: {e}")
 
                     from verl.trainer.ppo.rollout_corr_helper import (
                         compute_rollout_correction_and_add_to_batch,
