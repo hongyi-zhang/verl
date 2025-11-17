@@ -962,6 +962,7 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         from omegaconf import OmegaConf
+        import os
 
         from verl.utils.tracking import Tracking
 
@@ -974,6 +975,11 @@ class RayPPOTrainer:
 
         # Enable privileged context self-distillation flow if configured
         use_pcsd = getattr(self.config.algorithm, "privileged_distill", False)
+        # Optional one-off debug step: set env PCSD_DEBUG_STEP=100 to trigger prints
+        try:
+            debug_step = int(os.getenv("PCSD_DEBUG_STEP", "-1"))
+        except Exception:
+            debug_step = -1
 
         self.global_steps = 0
 
@@ -1048,6 +1054,47 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                        # Optional debug print of question/answer/privileged_context
+                        try:
+                            debug_print = bool(self.config.trainer.get("debug_print_samples", False))
+                            debug_every = int(self.config.trainer.get("debug_print_every", 50))
+                        except Exception:
+                            debug_print, debug_every = False, 50
+                        if debug_print and (self.global_steps % max(1, debug_every) == 0):
+                            try:
+                                # Decode first sample prompt (question) and rollout answer
+                                prompt_ids_0 = gen_batch_output.batch["prompts"][0] if "prompts" in gen_batch_output.batch.keys() else gen_batch.batch["input_ids"][0]
+                                resp_ids_0 = gen_batch_output.batch["responses"][0]
+                                q_text_full = self.tokenizer.decode(prompt_ids_0, skip_special_tokens=True)
+                                # Try to extract the actual question after 'Question:' to avoid chat-template system text
+                                q_text = q_text_full
+                                try:
+                                    import re as _re
+                                    m = _re.search(r"Question:\\s*(.*)", q_text_full, flags=_re.IGNORECASE | _re.DOTALL)
+                                    if m:
+                                        q_text = m.group(1).split("\\n")[0]
+                                except Exception:
+                                    pass
+                                a_text = self.tokenizer.decode(resp_ids_0, skip_special_tokens=True)
+                                # Privileged context preview from original gen batch extra_info
+                                pc_preview = ""
+                                # Note: extra_info is retained on the original 'batch' (not in gen_batch)
+                                if "extra_info" in batch.non_tensor_batch:
+                                    try:
+                                        ei0 = batch.non_tensor_batch["extra_info"][0]
+                                        if isinstance(ei0, dict):
+                                            pc = ei0.get("privileged_context", "")
+                                            if isinstance(pc, str):
+                                                pc_preview = pc[:200]
+                                    except Exception:
+                                        pc_preview = ""
+                                print("[DEBUG SAMPLE]")
+                                print("  Question:", q_text[:200])
+                                print("  Rollout Answer:", a_text[:200])
+                                print("  Privileged Preview:", pc_preview)
+                            except Exception as _:
+                                pass
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1082,6 +1129,34 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    # Debug A: print one batch's masks + texts + sampling params when debug_step matches
+                    if self.global_steps == debug_step:
+                        try:
+                            ids0 = batch.batch["input_ids"][0]
+                            mask0 = batch.batch["response_mask"][0]
+                            resp_ids0 = batch.batch["responses"][0]
+                            resp_len0 = int(mask0.sum().item()) if mask0 is not None else int(resp_ids0.shape[-1])
+                            text0 = self.kTokenizer.decode(ids0, skip_special_tokens=False) if hasattr(self, "kTokenizer") else self.tokenizer.decode(ids0, skip_special_tokens=False)
+                            first_resp_id = int(resp_ids0[0].item()) if resp_len0 > 0 else None
+                            eos_id_dbg = getattr(self.tokenizer, "eos_token_id", None)
+                            cfg = self.config.actor_rollout_ref.rollout
+                            print("==== PCSD DEBUG (A) input_ids[0] decoded ====")
+                            print(text0)
+                            print("==== PCSD DEBUG (A) response_mask[0] ====")
+                            print(mask0.tolist())
+                            print(
+                                f"==== PCSD DEBUG (A) sampling: temp={getattr(cfg,'temperature',None)} "
+                                f"top_p={getattr(cfg,'top_p',None)} top_k={getattr(cfg,'top_k',None)} "
+                                f"ignore_eos={getattr(cfg,'ignore_eos', None)} resp_len={resp_len0} eos_id={eos_id_dbg} "
+                                f"first_resp_id={first_resp_id}"
+                            )
+                            if resp_len0 and resp_ids0.numel() > 0:
+                                print("==== PCSD DEBUG (A) response_ids[0:10] ====",
+                                      resp_ids0[: min(10, resp_len0)].tolist())
+                                print("==== PCSD DEBUG (A) response_text[0:120] ====",
+                                      self.tokenizer.decode(resp_ids0[: min(30, resp_len0)], skip_special_tokens=False))
+                        except Exception as e:
+                            print(f"PCSD DEBUG (A) failed: {e}")
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1108,6 +1183,28 @@ class RayPPOTrainer:
                                 )
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                                # Debug B: print reward raw texts and parsed score (first sample)
+                                if self.global_steps == debug_step:
+                                    try:
+                                        prompt_ids0 = batch.batch["prompts"][0]
+                                        resp_ids = batch.batch["responses"][0]
+                                        # estimate valid response length via response_mask if available
+                                        if "response_mask" in batch.batch:
+                                            valid_len = int(batch.batch["response_mask"][0].sum().item())
+                                        else:
+                                            valid_len = resp_ids.shape[-1]
+                                        resp_ids0 = resp_ids[:valid_len]
+                                        prompt_text = self.tokenizer.decode(prompt_ids0, skip_special_tokens=False)
+                                        response_text = self.tokenizer.decode(resp_ids0, skip_special_tokens=False)
+                                        parsed_score = (
+                                            reward_tensor[0, valid_len - 1].item() if valid_len > 0 else float("nan")
+                                        )
+                                        print("==== PCSD DEBUG (B) reward ====")
+                                        print("prompt_text:", prompt_text)
+                                        print("response_text:", response_text)
+                                        print("parsed score (last token):", parsed_score)
+                                    except Exception as e:
+                                        print(f"PCSD DEBUG (B) failed: {e}")
 
                     from verl.trainer.ppo.rollout_corr_helper import (
                         compute_rollout_correction_and_add_to_batch,

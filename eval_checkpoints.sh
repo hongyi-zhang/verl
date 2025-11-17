@@ -1,0 +1,12 @@
+python /workspace/verl/scripts/eval_checkpoints.py \
+  --checkpoint_root checkpoints/pcsd_demo/pcsd_news \
+  --steps 100,200,300,400,500 \
+  --dataset_path /workspace/pcsd_data/news_all.parquet \
+  --question_col prompt \
+  --answer_json_col extra_info \
+  --answer_json_key answer \
+  --limit 200 \
+  --max_new_tokens 256 \
+  --temperature 0.0 \
+  --top_p 1.0 \
+  --save_jsonl
